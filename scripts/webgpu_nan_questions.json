@@ -1,0 +1,182 @@
+[
+  {
+    "context": "Question: At which temperature does water freeze?\nAnswer:",
+    "choices": [
+      " 0 degrees Celsius",
+      " 32 degrees Celsius",
+      " 100 degrees Celsius",
+      " 212 degrees Celsius"
+    ],
+    "nan_flags": [
+      false,
+      true,
+      false,
+      true
+    ]
+  },
+  {
+    "context": "Question: Molly was making iced tea by putting tea bags in boiling water. She needed to cool the hot tea quickly, so she poured it into a pitcher full of ice. Which best describes the flow of thermal energy?\nAnswer:",
+    "choices": [
+      " from the ice to the tea",
+      " from the tea to the ice",
+      " from the pitcher to the tea",
+      " from the ice to the pitcher"
+    ],
+    "nan_flags": [
+      true,
+      true,
+      false,
+      true
+    ]
+  },
+  {
+    "context": "Question: It was once thought that living organisms could come from non-living matter. For example, people believed that flies would develop from rotting meat. This idea was later disproved primarily because of\nAnswer:",
+    "choices": [
+      " the discovery of the atom.",
+      " better surgical techniques.",
+      " continued experimentation.",
+      " the invention of the microscope."
+    ],
+    "nan_flags": [
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  {
+    "context": "Question: Cells take in food for energy. The part of the cell that aids in digestion of the food is the lysosome. What is the main role of lysosomes in the process of food digestion?\nAnswer:",
+    "choices": [
+      " building proteins",
+      " breaking down wastes",
+      " controlling the activities of the cell",
+      " converting energy from one form into another"
+    ],
+    "nan_flags": [
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  {
+    "context": "Question: When an electric current is passed through water (H_{2}O) using a specific apparatus, hydrogen (H_{2}) and oxygen (O_{2}) gases form. How can this reaction be shown in a chemical equation?\nAnswer:",
+    "choices": [
+      " H_{2}O -> H + O + H",
+      " 2H_{2}O(l) -> 2H_{2}(g) + O_{2}(g)",
+      " H:O:H -> H_{2}O",
+      " H_{2}O(l) -> 2H(g) + O(g)"
+    ],
+    "nan_flags": [
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  {
+    "context": "Question: A glass of water at 110°F is placed in a room next to a glass of water that is 50°F. The temperature of the room is 73°F at all times. If the two glasses were left in the room overnight, the temperature for both glasses of water the next day would be approximately\nAnswer:",
+    "choices": [
+      " 43°F.",
+      " 50°F.",
+      " 73°F.",
+      " 90°F."
+    ],
+    "nan_flags": [
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  {
+    "context": "Question: Snow, rain, hail, and fog are all forms of\nAnswer:",
+    "choices": [
+      " gas.",
+      " water.",
+      " wind.",
+      " clouds."
+    ],
+    "nan_flags": [
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  {
+    "context": "Question: On August 21, a flash flood warning was issued for the Las Vegas area. Which statement best describes this warning in terms of weather and climate?\nAnswer:",
+    "choices": [
+      " It is a constant climate feature throughout the year.",
+      " It is a seasonal weather feature with irregular occurrences.",
+      " It is a continuous weather feature during the season in which it occurs.",
+      " It is a rare event inconsistent with local climate and weather."
+    ],
+    "nan_flags": [
+      true,
+      true,
+      false,
+      true
+    ]
+  },
+  {
+    "context": "Question: Students heated three objects to different temperatures during a classroom demonstration. Each object emitted light of a different color as shown below. Object 1: blue light Object 2: red light Object 3: orange light Which list presents the objects in order from highest to lowest temperature?\nAnswer:",
+    "choices": [
+      " Object 1, Object 2, Object 3",
+      " Object 1, Object 3, Object 2",
+      " Object 2, Object 1, Object 3",
+      " Object 2, Object 3, Object 1"
+    ],
+    "nan_flags": [
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  {
+    "context": "Question: Tiny organisms called plankton live in oceans. Some plankton can take energy from the Sun and turn it into food. How are plankton most useful to the animals that live in the ocean?\nAnswer:",
+    "choices": [
+      " Plankton are colorful.",
+      " Plankton clean the water.",
+      " Plankton release oxygen.",
+      " Plankton reproduce quickly."
+    ],
+    "nan_flags": [
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  {
+    "context": "Question: Which statement describes a positive effect of a scientific discovery?\nAnswer:",
+    "choices": [
+      " It makes some people upset.",
+      " It takes a long time to be useful.",
+      " It helps explain how things work.",
+      " It causes work to be more difficult."
+    ],
+    "nan_flags": [
+      true,
+      false,
+      false,
+      true
+    ]
+  },
+  {
+    "context": "Question: Which natural event occurs with the most frequency?\nAnswer:",
+    "choices": [
+      " sunrise",
+      " equinox",
+      " full moon",
+      " solar eclipse"
+    ],
+    "nan_flags": [
+      true,
+      true,
+      true,
+      true
+    ]
+  }
+]
