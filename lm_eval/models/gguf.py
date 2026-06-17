@@ -51,6 +51,65 @@ class GGUFLM(LM):
         self._loglikelihood_checked = False
         self._use_fallback = False
         self._n_vocab = None
+        self._props = None
+
+    def _get_props(self):
+        if self._props is not None:
+            return self._props
+        # Low retry count so a server that lacks /props fails fast instead of
+        # blocking for minutes on exponential backoff.
+        self._props = self._request_json("GET", "/props", retries=3)
+        return self._props
+
+    @property
+    def tokenizer_name(self) -> str:
+        # Only used as a cache-fingerprint string, not a real HF tokenizer name.
+        props = self._get_props()
+        identifier = props.get("model_path") or props.get("model") or self.base_url
+        return str(identifier).replace("/", "__").replace("\\", "__")
+
+    def chat_template(self, chat_template: bool | str = False) -> str | None:
+        if isinstance(chat_template, str):
+            return chat_template
+        if not chat_template:
+            return ""
+        # Report the model's embedded chat template (for cache fingerprinting).
+        return self._get_props().get("chat_template") or ""
+
+    def _render_template(self, messages):
+        response = self._request_json(
+            "POST", "/apply-template", {"messages": messages}, retries=3
+        )
+        prompt = response.get("prompt")
+        if not isinstance(prompt, str):
+            raise ValueError(
+                "Invalid /apply-template response: missing 'prompt' string. "
+                "Ensure llama-server is started with --jinja and supports "
+                "the /apply-template endpoint."
+            )
+        return prompt
+
+    def apply_chat_template(
+        self, chat_history: list[dict], add_generation_prompt: bool = True
+    ) -> str:
+        """Render chat messages to a prompt using the model's chat template.
+
+        llama-server's /apply-template always appends the assistant generation
+        prompt. For the prefill case (add_generation_prompt=False with a trailing
+        assistant message, e.g. tasks using gen_prefix), render everything up to
+        that final assistant turn WITH the generation prompt, then append the
+        assistant prefix text so the model continues directly from it.
+        """
+        if (
+            not add_generation_prompt
+            and chat_history
+            and chat_history[-1].get("role") == "assistant"
+        ):
+            prefix = chat_history[-1].get("content", "")
+            prior = chat_history[:-1]
+            rendered = self._render_template(prior) if prior else ""
+            return rendered + prefix
+        return self._render_template(chat_history)
 
     def gguf_completion(
         self, context, continuation=None, stop=None, retries=20, delay=5, **kwargs
@@ -61,8 +120,11 @@ class GGUFLM(LM):
                 request = {
                     "prompt": prompt,
                     "logprobs": self.logprobs,
-                    "temperature": self.temperature,
+                    "temperature": kwargs.get("temperature", self.temperature),
                 }
+                max_tokens = kwargs.get("max_tokens")
+                if max_tokens is not None:
+                    request["max_tokens"] = max_tokens
                 if continuation:
                     prompt += continuation
                     request.update({"prompt": prompt, "max_tokens": 1, "echo": True})
@@ -294,7 +356,17 @@ class GGUFLM(LM):
             inp = request[0]
             request_args = request[1]
             until = request_args.get("until", ["</s>"])
-            response = self.gguf_completion(context=inp, stop=until)
+            # Honor the task/CLI generation budget. Without this the server's
+            # default n_predict is used, which lets reasoning models ramble (or
+            # loop) far past the intended cap.
+            max_gen_toks = request_args.get("max_gen_toks", self.max_length)
+            temperature = request_args.get("temperature", self.temperature)
+            response = self.gguf_completion(
+                context=inp,
+                stop=until,
+                max_tokens=max_gen_toks,
+                temperature=temperature,
+            )
             if response and "choices" in response and response["choices"]:
                 choice = response["choices"][0]
                 if "text" in choice:

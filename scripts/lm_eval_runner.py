@@ -1,5 +1,4 @@
 import argparse
-import fnmatch
 import importlib
 import json
 import os
@@ -25,7 +24,7 @@ DEFAULT_LLAMACPP_SERVER_BINARY = (
     DEFAULT_PROJECT_ROOT / "benchmarks" / "llama-b8826-bin-win-vulkan-x64" / "llama-server.exe"
 )
 
-DEFAULT_TASKS = ["arc_challenge", "winogrande", "mmlu", "hellaswag"]
+DEFAULT_TASKS = ["arc_challenge_chat", "winogrande", "mmlu", "hellaswag"]
 BACKEND_CHOICES = ["auto", "openvino", "llama.cpp", "onnxruntime"]
 DEFAULT_ONNX_PROVIDER = "WebGpuExecutionProvider"
 WEBGPU_BACKEND_CHOICES = ["auto", "vulkan", "d3d12"]
@@ -35,11 +34,38 @@ ONNX_PROVIDER_TO_GENAI_KEY: dict[str, str] = {
     "WebGpuExecutionProvider": "webgpu",
 }
 
-# Apply chat template only to model families that typically need chat/instruction formatting.
-DEFAULT_CHAT_TEMPLATE_MODEL_PATTERNS = [
-    "*instruct*",
-    "*deepseek-r1-distill*",
-]
+# Per-task evaluation configuration.
+# Generative / chat-style tasks (e.g. *_chat, *_cot) need the model's chat
+# template applied and a larger generation budget so reasoning models can finish
+# their analysis before emitting the final answer. Tasks not listed here run with
+# plain prompts and the harness/task defaults.
+#   - apply_chat_template: pass --apply_chat_template. The openvino (HFLM-based)
+#       and llama.cpp (gguf, via llama-server /apply-template) backends implement
+#       chat templating natively; the onnxruntime backend applies it via a
+#       HuggingFace tokenizer loaded from the --tokenizer path.
+#   - gen_kwargs: value forwarded to lm-eval --gen_kwargs (e.g. max_gen_toks).
+TASK_CONFIGS: dict[str, dict[str, Any]] = {
+    "arc_challenge_chat": {
+        "apply_chat_template": True,
+        "gen_kwargs": "max_gen_toks=1024",
+    },
+    "arc_challenge_chat_cot": {
+        # CoT variant carries its own generation_kwargs (max_gen_toks, until) in
+        # the task yaml, so no gen_kwargs override here.
+        "apply_chat_template": True,
+    },
+}
+
+# Per-model task overrides. Reasoning/distill models (e.g. DeepSeek-R1-distill)
+# score poorly on the forced-answer-prefix chat tasks because they must reason
+# before answering; route them to the CoT variant instead. Keys are
+# case-insensitive substrings matched against the model directory name; values
+# map a base task name to its replacement for that model.
+MODEL_TASK_OVERRIDES: dict[str, dict[str, str]] = {
+    "deepseek-r1-distill": {
+        "arc_challenge_chat": "arc_challenge_chat",
+    },
+}
 
 @dataclass(frozen=True)
 class ModelSpec:
@@ -51,10 +77,6 @@ def parse_csv(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
-def parse_wildcard_patterns(value: str) -> list[str]:
-    return [item.lower() for item in parse_csv(value)]
-
-
 def append_model_arg(parts: list[str], key: str, value: str | None) -> None:
     if value is not None and value != "":
         parts.append(f"{key}={value}")
@@ -62,6 +84,20 @@ def append_model_arg(parts: list[str], key: str, value: str | None) -> None:
 
 def resolve_task_num_fewshot(_task: str, forced_num_fewshot: int | None) -> int | None:
     return forced_num_fewshot
+
+
+def resolve_model_task(model_name: str, task: str) -> str:
+    """Swap a base task for a model-specific variant when configured.
+
+    Matches MODEL_TASK_OVERRIDES keys as case-insensitive substrings of the
+    model directory name and returns the mapped task, or the original task when
+    no override applies.
+    """
+    name_lower = model_name.lower()
+    for key, overrides in MODEL_TASK_OVERRIDES.items():
+        if key in name_lower and task in overrides:
+            return overrides[task]
+    return task
 
 
 def canonical_backend_name(name: str) -> str:
@@ -75,23 +111,6 @@ def canonical_backend_name(name: str) -> str:
     if normalized == "auto":
         return "auto"
     raise ValueError(f"Unsupported backend: {name}")
-
-
-def normalize_model_name(name: str) -> str:
-    return "".join(ch.lower() if ch.isalnum() else "-" for ch in name).strip("-")
-
-
-def model_requires_chat_template(model_name: str, extra_patterns: list[str]) -> bool:
-    model_name_lower = model_name.lower()
-    normalized_model_name = normalize_model_name(model_name)
-    patterns = [*DEFAULT_CHAT_TEMPLATE_MODEL_PATTERNS, *extra_patterns]
-    for pattern in patterns:
-        if (
-            fnmatch.fnmatch(model_name_lower, pattern)
-            or fnmatch.fnmatch(normalized_model_name, pattern)
-        ):
-            return True
-    return False
 
 
 def detect_backend(path: Path) -> str | None:
@@ -325,7 +344,23 @@ def ensure_project_venv(project_root: Path, backend: str) -> Path:
     else:
         run_checked([str(venv_python), "-m", "pip", "install", "-e", "."], cwd=project_root)
 
+    # Use a single, recent transformers (5.x) across all backends. transformers
+    # 5.x is required by onnxruntime gpt-oss models, whose tokenizer_config.json
+    # declares "tokenizer_class": "TokenizersBackend" (a class that only exists in
+    # 5.0+). The openvino (optimum-intel) backend also works on 5.x once
+    # optimum-intel is upgraded to 2.0.0 (see below), so no per-backend split is
+    # needed.
+    #
+    # Pin >=5.5 to avoid the _patch_mistral_regex bug present in 5.0.0
+    # ("got multiple values for keyword argument 'fix_mistral_regex'" when loading
+    # e.g. Qwen3 tokenizers); it is fixed in later 5.x releases.
+    run_checked([str(venv_python), "-m", "pip", "install", "transformers>=5.5,<6.0"])
+
     if backend in {"auto", "openvino"}:
+        # optimum-intel 2.0.0 is the first release that allows transformers 5.x
+        # (older releases cap <4.58, which is incompatible with the shared 5.x
+        # pin above). optimum-onnx may emit a harmless pip metadata warning about
+        # transformers<4.58; it is not used on the openvino runtime path.
         run_checked(
             [
                 str(venv_python),
@@ -333,6 +368,7 @@ def ensure_project_venv(project_root: Path, backend: str) -> Path:
                 "pip",
                 "install",
                 "--upgrade",
+                "optimum-intel>=2.0.0",
                 "openvino",
                 "openvino-tokenizers",
                 "openvino-genai",
@@ -368,6 +404,9 @@ def ensure_project_venv(project_root: Path, backend: str) -> Path:
                 "onnxruntime-webgpu",
             ]
         )
+        # Re-assert the transformers pin in case onnxruntime-genai pulled in an
+        # older transformers that lacks the TokenizersBackend tokenizer class.
+        run_checked([str(venv_python), "-m", "pip", "install", "transformers>=5.5,<6.0"])
 
     if backend in {"auto", "llama.cpp"}:
         # llama.cpp backend uses llama-server in server mode only (no llama-cpp-python needed)
@@ -468,6 +507,9 @@ def _start_llama_server(
         "--port", str(port),
         "--n-gpu-layers", str(ngl),
         "-fa", "on",
+        # Use the GGUF's embedded Jinja chat template so /apply-template renders
+        # model-specific chat formatting (required for --apply_chat_template tasks).
+        "--jinja",
     ]
     print(f"[llama-server] Starting: {' '.join(cmd)}")
     if log_file is not None:
@@ -892,26 +934,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--log-samples", action="store_true")
-    parser.add_argument(
-        "--chat-template-mode",
-        choices=["auto", "always", "never"],
-        default="auto",
-        help=(
-            "Chat template strategy for generative tasks:\n"
-            "  auto   : Apply only if model matches configured patterns (e.g., *instruct*)\n"
-            "           AND task requirements are met (skips multiple-choice loglikelihood tasks).\n"
-            "  always : Force apply chat templates to all non-onnxruntime tasks.\n"
-            "  never  : Run without chat templates completely."
-        ),
-    )
-    parser.add_argument(
-        "--chat-template-model-patterns",
-        default="",
-        help=(
-            "Optional extra model wildcard patterns that should use chat template. "
-            "Comma-separated. Example: *qwen*,*chat*"
-        ),
-    )
     parser.add_argument("--extra-model-args", default="")
     # llama-server options (always used for llama.cpp backend)
     parser.add_argument(
@@ -1053,7 +1075,6 @@ def main() -> int:
         tasks.extend(parse_csv(t))
     if not tasks:
         raise ValueError("At least one task must be provided.")
-    chat_template_extra_patterns = parse_wildcard_patterns(args.chat_template_model_patterns)
 
     lm_eval_cmd_base = resolve_lm_eval_executable(venv_python)
 
@@ -1178,6 +1199,7 @@ def main() -> int:
             )
 
             for run_task in tasks:
+                run_task = resolve_model_task(spec.model_path.name, run_task)
                 run_tasks = [run_task]
                 run_num_fewshot = resolve_task_num_fewshot(run_task, args.num_fewshot)
                 result_dir = run_root / spec.backend / spec.model_path.name
@@ -1205,27 +1227,25 @@ def main() -> int:
                     cmd.extend(["--limit", str(args.limit)])
                 if args.log_samples:
                     cmd.append("--log_samples")
-                # onnxruntime backend does not implement lm-eval chat template
-                # support and can fail if this flag is forced.
-                # IMPORTANT: For multiple-choice loglikelihood tasks (arc_challenge, mmlu,
-                # winogrande, hellaswag), avoid auto-applying chat templates to preserve
-                # comparability with standard accuracy baselines.
-                should_apply_chat_template = False
-                is_multiple_choice_loglikelihood_task = any(
-                    mc in run_task.lower() for mc in ["arc_challenge", "mmlu", "winogrande", "hellaswag"]
+
+                # Per-task config drives chat templating and generation settings.
+                # All backends support chat templating: openvino (HFLM) and
+                # llama.cpp (gguf via llama-server /apply-template) natively, and
+                # onnxruntime via a HuggingFace tokenizer loaded from --tokenizer.
+                task_config = TASK_CONFIGS.get(run_task, {})
+                should_apply_chat_template = bool(
+                    task_config.get("apply_chat_template", False)
                 )
-
-                if spec.backend != "onnxruntime" and args.chat_template_mode != "never":
-                    if args.chat_template_mode == "always":
-                        should_apply_chat_template = True
-                    elif args.chat_template_mode == "auto" and not is_multiple_choice_loglikelihood_task:
-                        should_apply_chat_template = model_requires_chat_template(
-                            spec.model_path.name,
-                            chat_template_extra_patterns,
-                        )
-
                 if should_apply_chat_template:
                     cmd.append("--apply_chat_template")
+
+                # The onnxruntime backend caps generation internally via its
+                # max_gen_toks property, so skip the explicit max_gen_toks
+                # gen_kwargs there to avoid the large KV-cache allocation.
+                task_gen_kwargs = task_config.get("gen_kwargs")
+                if task_gen_kwargs and spec.backend != "onnxruntime":
+                    cmd.extend(["--gen_kwargs", str(task_gen_kwargs)])
+
                 if spec.backend == "openvino":
                     cmd.extend(["--device", "GPU"])
                 elif spec.backend == "llama.cpp":

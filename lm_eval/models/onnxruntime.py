@@ -14,6 +14,8 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import gc
+
 import numpy as np
 from tqdm import tqdm
 
@@ -67,6 +69,7 @@ class ONNXRuntimeGenAI(TemplateLM):
     def __init__(
         self,
         pretrained: str,
+        tokenizer: str | None = None,
         max_length: int | None = None,
         batch_size: int = 1,
         max_batch_size: int = 64,
@@ -77,6 +80,8 @@ class ONNXRuntimeGenAI(TemplateLM):
 
         Args:
             pretrained: Path to ONNX model file or directory containing model files
+            tokenizer: Optional path/name of a HuggingFace tokenizer used for chat
+                templating (``--apply_chat_template``). Defaults to ``pretrained``.
             max_length: Maximum sequence length
             batch_size: Batch size for inference
             max_batch_size: Maximum batch size for auto-batching
@@ -88,6 +93,7 @@ class ONNXRuntimeGenAI(TemplateLM):
 
         # Store configuration
         self.pretrained = pretrained
+        self._tokenizer_path = tokenizer or pretrained
         self.max_length = max_length or self._DEFAULT_MAX_LENGTH
         self.batch_size = batch_size
         self.max_batch_size = max_batch_size
@@ -111,6 +117,10 @@ class ONNXRuntimeGenAI(TemplateLM):
 
         # Load and compile ONNX model
         self._load_and_compile_model(pretrained)
+
+        # HuggingFace tokenizer is loaded lazily, only when chat templating is
+        # requested (see apply_chat_template / chat_template / tokenizer_name).
+        self._hf_tokenizer = None
 
         eval_logger.info("ONNXRuntime GenAI model initialized successfully")
 
@@ -325,9 +335,9 @@ class ONNXRuntimeGenAI(TemplateLM):
         Get the maximum number of tokens to generate.
 
         Returns:
-            Maximum generation tokens (default: 4096)
+            Maximum generation tokens (default: 1024)
         """
-        return self.max_length
+        return min(1024, self.max_length)
 
     def tok_encode(
         self,
@@ -367,6 +377,64 @@ class ONNXRuntimeGenAI(TemplateLM):
         """
         return self.genai_tokenizer.decode(tokens)
 
+    @property
+    def hf_tokenizer(self):
+        """Lazily load a HuggingFace tokenizer for chat templating.
+
+        The ONNX Runtime GenAI tokenizer does not expose chat templates, so we
+        load a transformers tokenizer from the ``tokenizer`` path (falling back to
+        ``pretrained``) to support ``--apply_chat_template``.
+        """
+        if self._hf_tokenizer is None:
+            try:
+                from transformers import AutoTokenizer
+            except ImportError as e:
+                raise ImportError(
+                    "Applying a chat template with the onnxruntime backend requires "
+                    "transformers. Install with: pip install transformers"
+                ) from e
+
+            self._hf_tokenizer = AutoTokenizer.from_pretrained(
+                self._tokenizer_path,
+                trust_remote_code=True,
+            )
+            eval_logger.info(
+                f"Loaded HuggingFace tokenizer for chat templating from: "
+                f"{self._tokenizer_path}"
+            )
+        return self._hf_tokenizer
+
+    @property
+    def tokenizer_name(self) -> str:
+        """Name of the tokenizer, used to fingerprint request caches."""
+        return str(self.hf_tokenizer.name_or_path).replace("/", "__")
+
+    def chat_template(self, chat_template: bool | str = False) -> str | None:
+        """Return the chat template string for this model's tokenizer."""
+        if chat_template is False or chat_template is None:
+            return None
+        template = getattr(self.hf_tokenizer, "chat_template", None)
+        if isinstance(template, dict):
+            key = chat_template if isinstance(chat_template, str) else "default"
+            return template.get(key) or next(iter(template.values()), None)
+        return template
+
+    def apply_chat_template(
+        self, chat_history: list[dict[str, str]], add_generation_prompt: bool = True
+    ) -> str:
+        """Apply the tokenizer's chat template to a chat history."""
+        if not getattr(self.hf_tokenizer, "chat_template", None):
+            raise NotImplementedError(
+                f"The tokenizer at '{self._tokenizer_path}' does not define a chat "
+                "template, so --apply_chat_template cannot be used with this model."
+            )
+        return self.hf_tokenizer.apply_chat_template(
+            chat_history,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+            continue_final_message=not add_generation_prompt,
+        )
+
     def _run_genai_inference_for_full_logits(self, input_text: str) -> np.ndarray:
         """
         Run inference using ONNX Runtime GenAI to get full logits sequence.
@@ -381,6 +449,8 @@ class ONNXRuntimeGenAI(TemplateLM):
         Raises:
             Exception: If inference fails
         """
+        params = None
+        generator = None
         try:
             # Encode input text to tokens
             input_tokens = self.genai_tokenizer.encode(input_text)
@@ -417,6 +487,11 @@ class ONNXRuntimeGenAI(TemplateLM):
         except Exception as e:
             eval_logger.error(f"GenAI inference failed: {e}")
             raise
+        finally:
+            # Release native ORT GenAI objects so the KV-cache buffer is
+            # reclaimed promptly instead of pooling across calls.
+            del generator
+            del params
 
     def _loglikelihood_tokens(
         self,
@@ -465,6 +540,8 @@ class ONNXRuntimeGenAI(TemplateLM):
                 results.append((0.0, True))
                 continue
 
+            params = None
+            gen = None
             try:
                 full_text = context + continuation
 
@@ -547,6 +624,12 @@ class ONNXRuntimeGenAI(TemplateLM):
 
                 eval_logger.debug(traceback.format_exc())
                 results.append((0.0, False))
+            finally:
+                # Explicitly release native ORT GenAI objects so the KV-cache
+                # buffer is reclaimed promptly instead of accumulating across
+                # requests (the native allocator pools memory aggressively).
+                del gen
+                del params
 
         return results
 
@@ -695,6 +778,8 @@ class ONNXRuntimeGenAI(TemplateLM):
         Returns:
             Generated text string
         """
+        params = None
+        generator = None
         try:
             # Encode prompt first so we know total length for max_length
             input_tokens = self.genai_tokenizer.encode(prompt)
@@ -773,3 +858,8 @@ class ONNXRuntimeGenAI(TemplateLM):
         except Exception as e:
             eval_logger.error(f"GenAI generation error: {e}")
             return ""
+        finally:
+            # Release native ORT GenAI objects so the KV-cache buffer is
+            # reclaimed promptly instead of pooling across calls.
+            del generator
+            del params
