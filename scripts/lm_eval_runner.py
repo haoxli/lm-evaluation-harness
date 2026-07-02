@@ -1188,7 +1188,7 @@ def main() -> int:
                 ngl=args.llama_server_ngl,
                 log_file=server_log,
             )
-            server_proc, server_url = _start_llama_server(**server_start_kwargs)
+            # Server is started fresh before each task; do not start here.
 
         try:
             model_backend, model_args = build_model_args(
@@ -1285,16 +1285,13 @@ def main() -> int:
                     run_records.append(record)
                     continue
 
-                # Verify llama-server is alive before each task and restart it if it
-                # crashed during a previous task. Each task is a separate lm_eval
-                # invocation, so a mid-run server crash only affects one task.
+                # Restart llama-server fresh before every task run so each
+                # evaluation starts with a clean server state.
                 if spec.backend == "llama.cpp" and server_start_kwargs is not None:
-                    server_proc, server_url = _ensure_llama_server_healthy(
-                        server_proc,
-                        "127.0.0.1",
-                        args.llama_server_port,
-                        server_start_kwargs,
-                    )
+                    if server_proc is not None:
+                        _stop_llama_server(server_proc)
+                        server_proc = None
+                    server_proc, server_url = _start_llama_server(**server_start_kwargs)
 
                 with log_file.open("w", encoding="utf-8") as fh:
                     fh.write(f"CMD: {' '.join(cmd)}\n")
