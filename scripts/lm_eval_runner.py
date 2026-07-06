@@ -24,7 +24,7 @@ DEFAULT_LLAMACPP_SERVER_BINARY = (
     DEFAULT_PROJECT_ROOT / "benchmarks" / "llama-b8826-bin-win-vulkan-x64" / "llama-server.exe"
 )
 
-DEFAULT_TASKS = ["arc_challenge_chat", "winogrande", "mmlu", "hellaswag"]
+DEFAULT_TASKS = ["arc_challenge_chat", "gsm8k_cot", "mmlu", "hellaswag"]
 BACKEND_CHOICES = ["auto", "openvino", "llama.cpp", "onnxruntime"]
 DEFAULT_ONNX_PROVIDER = "WebGpuExecutionProvider"
 WEBGPU_BACKEND_CHOICES = ["auto", "vulkan", "d3d12"]
@@ -236,6 +236,19 @@ def parse_major_minor(version: str | None) -> tuple[int, int] | None:
     return int(match.group(1)), int(match.group(2))
 
 
+def transformers_needs_mistral_regex_patch(version: str | None) -> bool:
+    """Return True when tokenizer_config should include fix_mistral_regex.
+
+    transformers 5.0.0 has a TokenizersBackend bug that can require this key,
+    while newer 5.x can raise a duplicate-key TypeError when the key is present.
+    """
+    parsed = parse_major_minor(version)
+    if parsed is None:
+        return False
+    major, minor = parsed
+    return major == 5 and minor == 0
+
+
 
 
 def normalize_onnx_provider_name(provider: str) -> str:
@@ -407,6 +420,10 @@ def ensure_project_venv(project_root: Path, backend: str) -> Path:
         # Re-assert the transformers pin in case onnxruntime-genai pulled in an
         # older transformers that lacks the TokenizersBackend tokenizer class.
         run_checked([str(venv_python), "-m", "pip", "install", "transformers>=5.5,<6.0"])
+
+    # Python 3.13 compatibility: older multiprocess versions may try to access
+    # private RLock internals removed in 3.13, causing noisy shutdown tracebacks.
+    run_checked([str(venv_python), "-m", "pip", "install", "--upgrade", "multiprocess>=0.70.17"]) 
 
     if backend in {"auto", "llama.cpp"}:
         # llama.cpp backend uses llama-server in server mode only (no llama-cpp-python needed)
@@ -1150,9 +1167,20 @@ def main() -> int:
     run_records: list[dict[str, Any]] = []
     failures = 0
 
+    transformers_version = get_installed_package_version(venv_python, "transformers")
+    needs_mistral_regex_patch = transformers_needs_mistral_regex_patch(transformers_version)
+    if transformers_version:
+        print(
+            "Transformers version",
+            transformers_version,
+            "=> tokenizer fix_mistral_regex patch",
+            "enabled" if needs_mistral_regex_patch else "disabled",
+        )
+
     for spec in specs:
-        # Auto-patch tokenizer_config.json to prevent Mistral regex warnings and incorrect tokenization
-        # Only apply patch for specific OpenVINO models that require it
+        # Keep tokenizer_config.json compatible with the currently installed
+        # transformers version. 5.0.0 may need fix_mistral_regex=True; newer
+        # 5.x can fail if the key is present due to duplicate kwargs.
         patch_models = ["Qwen3-4B-int4-ov", "gpt-oss-20b-int4-ov"]
         tok_dir = resolve_tokenizer_path(spec.model_path)
         if tok_dir and any(m in spec.model_path.name for m in patch_models):
@@ -1160,10 +1188,17 @@ def main() -> int:
                 tc_path = Path(tok_dir) / "tokenizer_config.json"
                 if tc_path.exists():
                     tc_data = json.loads(tc_path.read_text(encoding="utf-8"))
-                    if not tc_data.get("fix_mistral_regex"):
+                    if needs_mistral_regex_patch and not tc_data.get("fix_mistral_regex"):
                         tc_data["fix_mistral_regex"] = True
                         tc_path.write_text(json.dumps(tc_data, indent=2), encoding="utf-8")
                         print(f"Auto-patched {tc_path.name} with fix_mistral_regex=True for model {spec.model_path.name}")
+                    elif (not needs_mistral_regex_patch) and ("fix_mistral_regex" in tc_data):
+                        tc_data.pop("fix_mistral_regex", None)
+                        tc_path.write_text(json.dumps(tc_data, indent=2), encoding="utf-8")
+                        print(
+                            f"Removed fix_mistral_regex from {tc_path.name} for model {spec.model_path.name} "
+                            f"(transformers {transformers_version})"
+                        )
             except Exception as e:
                 print(f"Warning patching tokenizer_config.json: {e}")
 
@@ -1258,6 +1293,14 @@ def main() -> int:
                 else:
                     log_file = result_dir / f"run_{task_slug}.log"
 
+                # Restart llama-server fresh before every task run so each
+                # evaluation starts with a clean server state.
+                if spec.backend == "llama.cpp" and server_start_kwargs is not None and not args.dry_run:
+                    if server_proc is not None:
+                        _stop_llama_server(server_proc)
+                        server_proc = None
+                    server_proc, server_url = _start_llama_server(**server_start_kwargs)
+
                 print("\n" + "=" * 88)
                 print(f"Backend : {spec.backend}")
                 print(f"Model   : {spec.model_path}")
@@ -1284,14 +1327,6 @@ def main() -> int:
                     record["exit_code"] = None
                     run_records.append(record)
                     continue
-
-                # Restart llama-server fresh before every task run so each
-                # evaluation starts with a clean server state.
-                if spec.backend == "llama.cpp" and server_start_kwargs is not None:
-                    if server_proc is not None:
-                        _stop_llama_server(server_proc)
-                        server_proc = None
-                    server_proc, server_url = _start_llama_server(**server_start_kwargs)
 
                 with log_file.open("w", encoding="utf-8") as fh:
                     fh.write(f"CMD: {' '.join(cmd)}\n")
