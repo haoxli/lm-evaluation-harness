@@ -30,6 +30,22 @@ DEFAULT_ONNX_PROVIDER = "WebGpuExecutionProvider"
 WEBGPU_BACKEND_CHOICES = ["auto", "vulkan", "d3d12"]
 NON_FINITE_POLICY_CHOICES = ["error", "warn"]
 
+# Backend dependency profiles. transformers can only be one version at a time,
+# but the two runtimes require mutually incompatible pins, so switching backends
+# means re-pinning transformers.
+#   - onnxruntime profile (DEFAULT): transformers 5.13.0 is required by
+#       onnxruntime gpt-oss models whose tokenizer_config.json declares
+#       "tokenizer_class": "TokenizersBackend".
+#   - openvino profile: transformers <5.6 is required by optimum-intel git main
+#       (it hard-caps <5.6). Running the openvino backend under transformers
+#       >=5.6 silently corrupts Qwen3 int4 inference (mangled multi-digit
+#       numbers, degenerate loops -> near-zero gsm8k_cot accuracy).
+ONNX_TRANSFORMERS_SPEC = "transformers==5.13.0"
+OPENVINO_TRANSFORMERS_SPEC = "transformers>=5.5,<5.6"
+# Installed transformers with major.minor >= this tuple is the onnx profile and
+# is INCOMPATIBLE with the openvino backend.
+OPENVINO_TRANSFORMERS_MAX_EXCLUSIVE = (5, 6)
+
 ONNX_PROVIDER_TO_GENAI_KEY: dict[str, str] = {
     "WebGpuExecutionProvider": "webgpu",
 }
@@ -53,6 +69,26 @@ TASK_CONFIGS: dict[str, dict[str, Any]] = {
         # CoT variant carries its own generation_kwargs (max_gen_toks, until) in
         # the task yaml, so no gen_kwargs override here.
         "apply_chat_template": True,
+    },
+    "gsm8k_cot": {
+        # gsm8k_cot is a few-shot *completion* benchmark: the task yaml carries
+        # Q:/A: fewshot exemplars ending in the exact phrase "The answer is N.",
+        # and the strict/flexible filters extract the number with a regex that
+        # expects a digit immediately after "answer is". Do NOT apply a chat
+        # template here: (1) it breaks the few-shot completion format, and
+        # (2) instruct/reasoning models (e.g. Qwen3) then answer in markdown
+        # ("The answer is **3**" / "**$20**"), which the extraction regex cannot
+        # parse -> every sample scores "[invalid]".
+        #
+        # Raising max_gen_toks from the yaml default of 256 helps verbose models
+        # that would otherwise be truncated before "The answer is N", but note it
+        # is NOT a complete fix for greedy-decoded low-bit models (e.g.
+        # Qwen3-4B-int4-ov): those frequently degenerate into repetition loops
+        # ("The answer is 20. The answer is \\boxed{20}. ..." or a stuck
+        # arithmetic line) and either never emit a parseable answer or emit a
+        # wrong one. That residual low score is genuine model/quantization
+        # quality, not a harness or config problem.
+        "gen_kwargs": "max_gen_toks=768",
     },
 }
 
@@ -251,6 +287,61 @@ def transformers_needs_mistral_regex_patch(version: str | None) -> bool:
 
 
 
+def verify_openvino_transformers_profile(venv_python: Path, specs: list["ModelSpec"]) -> None:
+    """Stop before running the openvino backend if the wrong transformers is active.
+
+    The default environment uses the onnxruntime profile (transformers 5.13.0),
+    which is incompatible with the openvino backend: optimum-intel git main
+    hard-caps transformers <5.6, and running openvino under a newer transformers
+    silently corrupts Qwen3 int4 inference. If any openvino model is about to
+    run while an incompatible transformers is installed, abort with instructions
+    to reinstall the openvino profile.
+    """
+    if not any(spec.backend == "openvino" for spec in specs):
+        return
+
+    version = get_installed_package_version(venv_python, "transformers")
+    parsed = parse_major_minor(version)
+    if parsed is None:
+        print(
+            "Warning: could not determine the installed transformers version; "
+            "skipping the openvino profile check."
+        )
+        return
+
+    if parsed >= OPENVINO_TRANSFORMERS_MAX_EXCLUSIVE:
+        max_major, max_minor = OPENVINO_TRANSFORMERS_MAX_EXCLUSIVE
+        raise SystemExit(
+            "\n".join(
+                [
+                    "",
+                    "=" * 78,
+                    "ABORTING: openvino backend requested but the active dependency profile "
+                    "is onnx.",
+                    "=" * 78,
+                    f"  installed transformers : {version}",
+                    f"  openvino requires      : < {max_major}.{max_minor} "
+                    f"({OPENVINO_TRANSFORMERS_SPEC})",
+                    "",
+                    "Running openvino under this transformers version silently corrupts "
+                    "Qwen3 int4",
+                    "inference (near-zero gsm8k_cot accuracy). Reinstall the openvino "
+                    "profile first:",
+                    "",
+                    f'  {venv_python} -m pip install --upgrade '
+                    f'"git+https://github.com/huggingface/optimum-intel.git"',
+                    f'  {venv_python} -m pip install "{OPENVINO_TRANSFORMERS_SPEC}"',
+                    "",
+                    "To switch back to the default onnx profile afterwards:",
+                    f'  {venv_python} -m pip install "{ONNX_TRANSFORMERS_SPEC}"',
+                    "=" * 78,
+                ]
+            )
+        )
+
+
+
+
 def normalize_onnx_provider_name(provider: str) -> str:
     text = provider.strip()
     if not text:
@@ -357,23 +448,24 @@ def ensure_project_venv(project_root: Path, backend: str) -> Path:
     else:
         run_checked([str(venv_python), "-m", "pip", "install", "-e", "."], cwd=project_root)
 
-    # Use a single, recent transformers (5.x) across all backends. transformers
-    # 5.x is required by onnxruntime gpt-oss models, whose tokenizer_config.json
-    # declares "tokenizer_class": "TokenizersBackend" (a class that only exists in
-    # 5.0+). The openvino (optimum-intel) backend also works on 5.x once
-    # optimum-intel is upgraded to 2.0.0 (see below), so no per-backend split is
-    # needed.
+    # Default install uses the onnxruntime profile (transformers 5.13.0). The
+    # openvino backend needs an incompatible, older transformers, so it is
+    # installed as its own profile below and guarded at run time.
     #
-    # Pin >=5.5 to avoid the _patch_mistral_regex bug present in 5.0.0
-    # ("got multiple values for keyword argument 'fix_mistral_regex'" when loading
-    # e.g. Qwen3 tokenizers); it is fixed in later 5.x releases.
-    run_checked([str(venv_python), "-m", "pip", "install", "transformers>=5.5,<6.0"])
+    # transformers 5.13.0 is required by onnxruntime gpt-oss models, whose
+    # tokenizer_config.json declares "tokenizer_class": "TokenizersBackend"
+    # (a class that only exists in 5.x). Pin >=5.5 within the openvino profile to
+    # avoid the _patch_mistral_regex bug present in 5.0.0.
+    if backend == "openvino":
+        run_checked([str(venv_python), "-m", "pip", "install", OPENVINO_TRANSFORMERS_SPEC])
+    else:
+        run_checked([str(venv_python), "-m", "pip", "install", ONNX_TRANSFORMERS_SPEC])
 
-    if backend in {"auto", "openvino"}:
-        # optimum-intel 2.0.0 is the first release that allows transformers 5.x
-        # (older releases cap <4.58, which is incompatible with the shared 5.x
-        # pin above). optimum-onnx may emit a harmless pip metadata warning about
-        # transformers<4.58; it is not used on the openvino runtime path.
+    if backend == "openvino":
+        # openvino profile: optimum-intel git main is required to load OV models
+        # under transformers 5.x; it hard-caps transformers <5.6 and will pin it
+        # back down if anything drifted above. This profile is INCOMPATIBLE with
+        # the default onnx profile (transformers 5.13.0).
         run_checked(
             [
                 str(venv_python),
@@ -381,14 +473,32 @@ def ensure_project_venv(project_root: Path, backend: str) -> Path:
                 "pip",
                 "install",
                 "--upgrade",
-                "optimum-intel>=2.0.0",
+                "git+https://github.com/huggingface/optimum-intel.git",
                 "openvino",
                 "openvino-tokenizers",
                 "openvino-genai",
             ]
         )
-
-    if backend in {"auto", "onnxruntime"}:
+        # Re-assert the openvino transformers pin in case a dependency bumped it.
+        run_checked([str(venv_python), "-m", "pip", "install", OPENVINO_TRANSFORMERS_SPEC])
+    elif backend == "auto":
+        # auto still installs the openvino runtime binaries (they are compatible
+        # with any transformers), but NOT the optimum-intel git-main override,
+        # so the default onnx transformers profile is preserved. Actual openvino
+        # runs are blocked by the run-time guard until the openvino profile is
+        # installed with `--setup --backend openvino`.
+        run_checked(
+            [
+                str(venv_python),
+                "-m",
+                "pip",
+                "install",
+                "--upgrade",
+                "openvino",
+                "openvino-tokenizers",
+                "openvino-genai",
+            ]
+        )
         # For onnxruntime backend: install onnxruntime-genai, then onnxruntime-webgpu.
         #
         # IMPORTANT: install order matters. All three packages (onnxruntime,
@@ -417,9 +527,9 @@ def ensure_project_venv(project_root: Path, backend: str) -> Path:
                 "onnxruntime-webgpu",
             ]
         )
-        # Re-assert the transformers pin in case onnxruntime-genai pulled in an
-        # older transformers that lacks the TokenizersBackend tokenizer class.
-        run_checked([str(venv_python), "-m", "pip", "install", "transformers>=5.5,<6.0"])
+        # Re-assert the onnx transformers pin in case onnxruntime-genai pulled in
+        # an older transformers that lacks the TokenizersBackend tokenizer class.
+        run_checked([str(venv_python), "-m", "pip", "install", ONNX_TRANSFORMERS_SPEC])
 
     # Python 3.13 compatibility: older multiprocess versions may try to access
     # private RLock internals removed in 3.13, causing noisy shutdown tracebacks.
@@ -1139,6 +1249,13 @@ def main() -> int:
     if not specs:
         print("No models discovered.")
         return 1
+
+    # Guard: the default environment runs the onnx profile (transformers 5.13.0),
+    # which is incompatible with the openvino backend. Stop before launching any
+    # openvino run if the wrong transformers is installed and tell the user to
+    # reinstall the openvino profile.
+    if not args.dry_run:
+        verify_openvino_transformers_profile(venv_python, specs)
 
     has_onnx_specs = any(spec.backend == "onnxruntime" for spec in specs)
 
