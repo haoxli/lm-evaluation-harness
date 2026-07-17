@@ -1,0 +1,37 @@
+tag:
+  - multiple_choice_generative
+task: hellaswag_chat
+dataset_path: Rowan/hellaswag
+dataset_name: null
+output_type: generate_until
+training_split: train
+validation_split: validation
+test_split: null
+fewshot_split: train
+process_docs: !function utils.process_docs_cot
+# Present the four HellaSwag endings as labelled candidates (A, B, C, D) so a
+# chat/instruct model can pick a letter instead of being scored by raw
+# continuation loglikelihood (which reasoning models do poorly on).
+doc_to_text: 'Given the following context and four candidate continuations (A, B, C and D), choose the most plausible continuation.\nContext: {{query}}\nA. {{choices[0]}}\nB. {{choices[1]}}\nC. {{choices[2]}}\nD. {{choices[3]}}\nYour response should end with "The best answer is [the_answer_letter]" where the [the_answer_letter] is one of A, B, C or D.'
+gen_prefix: 'The best answer is'
+fewshot_delimiter: "\n\n"
+doc_to_target: "{{gold_letter}}"
+num_fewshot: 0
+generation_kwargs:
+  max_gen_toks: 100
+  until:
+    - "\n\n"
+    - "."
+metric_list:
+  - metric: exact_match
+    aggregation: mean
+    higher_is_better: true
+    ignore_case: true
+    ignore_punctuation: true
+filter_list:
+  - name: remove_whitespace
+    filter:
+      - function: remove_whitespace
+      - function: take_first
+metadata:
+  version: 1.0

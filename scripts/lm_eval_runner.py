@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_PROJECT_ROOT = Path(r"d:\workspace\project\llm")
+DEFAULT_PROJECT_ROOT = Path(r"c:\workspace\project\llm")
 LM_EVALUATION_HARNESS_ROOT = DEFAULT_PROJECT_ROOT / "lm-evaluation-harness"
 DEFAULT_MODEL_ROOT = DEFAULT_PROJECT_ROOT / "models"
 DEFAULT_OPENVINO_MODELS_ROOT = DEFAULT_MODEL_ROOT / "ov-genai"
@@ -66,6 +66,15 @@ TASK_CONFIGS: dict[str, dict[str, Any]] = {
         "gen_kwargs": "max_gen_toks=1024",
     },
     "arc_challenge_chat_cot": {
+        # CoT variant carries its own generation_kwargs (max_gen_toks, until) in
+        # the task yaml, so no gen_kwargs override here.
+        "apply_chat_template": True,
+    },
+    "hellaswag_chat": {
+        "apply_chat_template": True,
+        "gen_kwargs": "max_gen_toks=100",
+    },
+    "hellaswag_cot": {
         # CoT variant carries its own generation_kwargs (max_gen_toks, until) in
         # the task yaml, so no gen_kwargs override here.
         "apply_chat_template": True,
